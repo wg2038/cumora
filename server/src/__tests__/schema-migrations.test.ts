@@ -19,6 +19,8 @@ const { agentRuntimeAssignmentChecksum } = await import('../db/migrations/0004-a
 const { searchTrigramIndexChecksum } = await import('../db/migrations/0005-search-trigram-index.js')
 const { emailMessagesCompanySmtpIdChecksum } = await import('../db/migrations/0006-email-messages-company-smtp-id.js')
 const { engineDefaultsChecksum } = await import('../db/migrations/0007-engine-defaults.js')
+const { agentProviderProfileChecksum } = await import('../db/migrations/0008-agent-provider-profile.js')
+const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -50,6 +52,14 @@ test('the email messages company smtp id migration matches its immutable manifes
 
 test('the engine defaults migration matches its immutable manifest checksum', () => {
   assert.equal(engineDefaultsChecksum(), SCHEMA_MIGRATIONS[6].checksum)
+})
+
+test('the agent provider profile migration matches its immutable manifest checksum', () => {
+  assert.equal(agentProviderProfileChecksum(), SCHEMA_MIGRATIONS[7].checksum)
+})
+
+test('the agent routing claims migration matches its immutable manifest checksum', () => {
+  assert.equal(agentRoutingClaimsChecksum(), SCHEMA_MIGRATIONS[8].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {
