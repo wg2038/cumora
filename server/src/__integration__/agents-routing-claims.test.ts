@@ -180,3 +180,77 @@ test('[integration] routing-claims: sweep exhausts and falls back to full-room f
   const updated = await getClaim(messageId)
   assert.equal(updated?.status, 'exhausted')
 })
+
+test('[integration] routing-claims: sweep served wakes cursor-lagging room members on PostgreSQL', async () => {
+  await seedFixture()
+  const messageId = 'msg-sweep-catchup'
+
+  // Seed the unaddressed group message
+  await pool.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, created_at)
+     VALUES ($1, $2, 'human-1', 'text', 'who can look into this?', 1, $3, NOW() - INTERVAL '60 seconds')`,
+    [messageId, CONVERSATION_ID, COMPANY_ID],
+  )
+
+  await claimPrimary({
+    messageId,
+    companyId: COMPANY_ID,
+    conversationId: CONVERSATION_ID,
+    orderedCandidates: [AGENT_A, AGENT_B],
+  })
+
+  // Expire the lease in the past
+  await pool.query(
+    `UPDATE agent_routing_claims
+        SET lease_expires_at = NOW() - INTERVAL '10 seconds'
+      WHERE message_id = $1`,
+    [messageId],
+  )
+
+  // Primary AGENT_A has run since anchor, but AGENT_B was not woken at T=0 and its cursor lags behind
+  const decisions = await sweepRoutingClaimsOnce({
+    hasRunSince: async (_agentId) => true,
+  })
+
+  assert.equal(decisions.length, 1)
+  assert.deepEqual(decisions[0], {
+    kind: 'catchup',
+    conversationId: CONVERSATION_ID,
+    room: [AGENT_B],
+  })
+
+  const claim = await getClaim(messageId)
+  assert.equal(claim?.status, 'served')
+
+  // When AGENT_B's cursor catches up, a subsequent claim served emits no catchup wake
+  await pool.query(
+    `INSERT INTO conversation_reads (user_id, conversation_id, last_read_at, last_read_message_id)
+     VALUES ($1, $2, NOW(), $3)
+     ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW(), last_read_message_id = $3`,
+    [AGENT_B, CONVERSATION_ID, messageId],
+  )
+
+  const messageId2 = 'msg-sweep-caught-up'
+  await pool.query(
+    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id, created_at)
+     VALUES ($1, $2, 'human-1', 'text', 'another question', 2, $3, NOW() - INTERVAL '30 seconds')`,
+    [messageId2, CONVERSATION_ID, COMPANY_ID],
+  )
+  await claimPrimary({
+    messageId: messageId2,
+    companyId: COMPANY_ID,
+    conversationId: CONVERSATION_ID,
+    orderedCandidates: [AGENT_A, AGENT_B],
+  })
+  await pool.query(
+    `UPDATE agent_routing_claims
+        SET lease_expires_at = NOW() - INTERVAL '10 seconds'
+      WHERE message_id = $1`,
+    [messageId2],
+  )
+
+  const decisions2 = await sweepRoutingClaimsOnce({
+    hasRunSince: async (_agentId) => true,
+  })
+  assert.equal(decisions2.length, 0)
+})

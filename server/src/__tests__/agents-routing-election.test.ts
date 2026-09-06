@@ -129,6 +129,7 @@ const SERVE_OR_EXHAUST = 'UPDATE agent_routing_claims SET status'
 const ADVANCE = 'UPDATE agent_routing_claims\n          SET cursor'
 const REAP = 'DELETE FROM agent_routing_claims'
 const GET = 'SELECT message_id'
+const LAGGING = 'SELECT cm.participant_id'
 
 test('claimPrimary returns the fresh row to the winner and the existing row to a re-delivery', async () => {
   mockPool((sql) => {
@@ -164,6 +165,7 @@ test('the sweep serves a claim whose primary started any turn since the claim', 
       updates.push(sql)
       return { rows: [] }
     }
+    if (sql.startsWith(LAGGING)) return { rows: [] }
     if (sql.startsWith(REAP)) return { rows: [] }
     throw new Error('unexpected: ' + sql.slice(0, 60))
   })
@@ -171,6 +173,22 @@ test('the sweep serves a claim whose primary started any turn since the claim', 
   assert.deepEqual(wakes, [])
   assert.equal(updates.length, 1)
   assert.match(updates[0], /status = 'served'/)
+})
+
+test('the sweep wakes cursor-lagging room members when a claim resolves as served', async () => {
+  // Resolves the cursor-exposure window finding from yetone's review (#123):
+  // When primary serves the claim, unwoken members whose read cursor still
+  // lags behind the message are woken to close the correctness hole.
+  mockPool((sql) => {
+    if (sql.startsWith(TAKE)) return { rows: [{ messageId: 'm1', companyId: 'c1', conversationId: 'conv1', candidates: ['iris', 'atlas'], cursor: 0, status: 'pending', createdAt: new Date(NOW - 120_000) }] }
+    if (sql.startsWith('SELECT id FROM agent_runs')) return { rows: [{ id: 'r1' }] }
+    if (sql.startsWith(SERVE_OR_EXHAUST)) return { rows: [] }
+    if (sql.startsWith(LAGGING)) return { rows: [{ participant_id: 'atlas' }] }
+    if (sql.startsWith(REAP)) return { rows: [] }
+    throw new Error('unexpected: ' + sql.slice(0, 60))
+  })
+  const decisions = await sweepRoutingClaimsOnce()
+  assert.deepEqual(decisions, [{ kind: 'catchup', conversationId: 'conv1', room: ['atlas'] }])
 })
 
 test('the sweep advances to the next candidate when the primary went quiet', async () => {

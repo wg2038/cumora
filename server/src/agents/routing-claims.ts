@@ -139,10 +139,16 @@ function toClaim(r: RoutingClaimRow): RoutingClaim {
 export type SweepDecision =
   | { kind: 'advance'; agentId: string; conversationId: string }
   | { kind: 'exhaust'; conversationId: string; room: string[] }
+  | { kind: 'catchup'; conversationId: string; room: string[] }
 
-export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSince?: (agentId: string, since: Date, companyId: string | null) => Promise<boolean> } = {}): Promise<SweepDecision[]> {
+export async function sweepRoutingClaimsOnce(opts: {
+  leaseMs?: number
+  hasRunSince?: (agentId: string, since: Date, companyId: string | null) => Promise<boolean>
+  findLaggingMembers?: (conversationId: string, messageId: string, companyId: string | null, excludeAgentId: string) => Promise<string[]>
+} = {}): Promise<SweepDecision[]> {
   const leaseMs = opts.leaseMs ?? ELECTION_LEASE_MS
   const hasRunSince = opts.hasRunSince ?? defaultHasRunSince
+  const findLaggingMembers = opts.findLaggingMembers ?? defaultFindCursorLaggingMembers
   const decisions: SweepDecision[] = []
 
   const due = await pool.query<TakenRow>(
@@ -176,6 +182,14 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
     const anchor = row.cursorAdvancedAt ?? row.createdAt
     if (await hasRunSince(primary, anchor, row.companyId)) {
       await pool.query(`UPDATE agent_routing_claims SET status = 'served', updated_at = NOW() WHERE message_id = $1`, [row.messageId])
+      const lagging = await findLaggingMembers(row.conversationId, row.messageId, row.companyId, primary).catch((err) => {
+        console.error(`[routing] findCursorLaggingMembers failed for message ${row.messageId}:`, err instanceof Error ? err.message : err)
+        return []
+      })
+      if (lagging.length > 0) {
+        console.log(`[routing] claim for message ${row.messageId} served by ${primary} — waking ${lagging.length} cursor-lagging room member(s) to close exposure window`)
+        decisions.push({ kind: 'catchup', conversationId: row.conversationId, room: lagging })
+      }
       continue
     }
     const nextCursor = row.cursor + 1
@@ -228,6 +242,41 @@ async function defaultHasRunSince(agentId: string, since: Date, companyId: strin
   return rows.length > 0
 }
 
+/** Find any active agent member in the conversation whose read cursor
+ *  is still behind this message. Used on claim resolution ('served') to
+ *  close the cursor-exposure window: room members that were not woken
+ *  for the election are woken once the claim resolves, catching their
+ *  cursor up and preventing silent message skipping on a subsequent post. */
+export async function defaultFindCursorLaggingMembers(
+  conversationId: string,
+  messageId: string,
+  companyId: string | null,
+  excludeAgentId: string,
+): Promise<string[]> {
+  const { rows } = await pool.query<{ participant_id: string }>(
+    `SELECT cm.participant_id
+       FROM conversation_members cm
+       JOIN participants p
+         ON p.id = cm.participant_id
+        AND p.company_id = cm.company_id
+        AND p.kind = 'agent'
+        AND p.departed_at IS NULL
+       JOIN messages m
+         ON m.id = $1
+       LEFT JOIN conversation_reads cr
+         ON cr.user_id = cm.participant_id
+        AND cr.conversation_id = cm.conversation_id
+      WHERE cm.conversation_id = $2
+        AND ($3::text IS NULL OR cm.company_id = $3)
+        AND cm.participant_id <> $4
+        AND ROW(COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz), COALESCE(cr.last_read_message_id, ''))
+            < ROW(m.created_at, m.id)
+      ORDER BY cm.ordinal ASC`,
+    [messageId, conversationId, companyId, excludeAgentId],
+  )
+  return rows.map((r) => r.participant_id)
+}
+
 function startRoutingClaimSweeper(intervalMs: number = SWEEP_INTERVAL_MS): NodeJS.Timeout {
   const tick = (): void => {
     sweepRoutingClaimsOnce()
@@ -238,9 +287,10 @@ function startRoutingClaimSweeper(intervalMs: number = SWEEP_INTERVAL_MS): NodeJ
             if (d.kind === 'advance') {
               await scheduler.wakeAgent(d.agentId, 'message.new', d.conversationId)
             } else {
-              // The election came up empty — hand the room back to the
-              // pre-election behaviour: one fan-out of the original lineup,
-              // then the row is terminal and the sweep never touches it again.
+              // Both 'exhaust' and 'catchup' fan out to the candidate list:
+              // - exhaust: election expired without a run; fall back to pre-election full fan-out
+              // - catchup: claim resolved (served); wake cursor-lagging members so their read cursor
+              //   catches up, eliminating the cursor-exposure window.
               await scheduler.fanOutWake(d.room, d.conversationId, null)
             }
           })().catch((err) => {
